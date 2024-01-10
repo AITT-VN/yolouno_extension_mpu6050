@@ -1,9 +1,9 @@
 <xml xmlns="https://developers.google.com/blockly/xml" id="toolbox" style="display: none">
   <category name="MPU6050" colour="#2ECC71" icon="compass">
-    <block type="uno_motion_init" />
-    <!-- <block type="uno_motionreset" /> -->
-    <block type="uno_motion_get_accel" />
-    <block type="uno_motion_get_gyro" />
-    <block type="uno_motion_is_shake" />
+    <block type="uno_mpu6050_init" />
+    <!-- <block type="uno_mpu6050reset" /> -->
+    <block type="uno_mpu6050_get_accel" />
+    <block type="uno_mpu6050_get_gyro" />
+    <block type="uno_mpu6050_is_shake" />
   </category>
 </xml>

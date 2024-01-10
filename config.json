@@ -2,7 +2,7 @@
     "name": "MPU6050",
     "description": "Mục mở rộng của Yolo UNO sử dụng cảm biến gia tốc GY-521 MPU6050",
     "libs": [
-        "motion.py"
+        "mpu6050.py"
     ],
     "blocks": [
         "definition.js"

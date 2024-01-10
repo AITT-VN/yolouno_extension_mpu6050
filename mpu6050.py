@@ -20,7 +20,7 @@ GYRO_YOUT_H  = const(0x45)
 GYRO_ZOUT_H  = const(0x47)
 TEMP_OUT_H   = const(0X41)
 
-class Motion:
+class MPU6050:
     def __init__(self, address=0x68):
         scl_pin = Pin(SCL_PIN)
         sda_pin = Pin(SDA_PIN)
@@ -288,5 +288,3 @@ class Motion:
                 time.sleep(wait_time / avg_count)
         finally:
             return total > shake_threshold
-
-motion = Motion()
