@@ -1,290 +1,375 @@
-import time
-import math
+# imu.py MicroPython driver for the InvenSense inertial measurement units
+# This is the base class
+# Adapted from Sebastian Plamauer's MPU9150 driver:
+# https://github.com/micropython-IMU/micropython-mpu9150.git
+# Authors Peter Hinch, Sebastian Plamauer
+# V0.2 17th May 2017 Platform independent: utime and machine replace pyb
+
+# User access is now by properties e.g.
+# myimu = MPU9250('X')
+# magx = myimu.mag.x
+# accelxyz = myimu.accel.xyz
+# Error handling: on code used for initialisation, abort with message
+# At runtime try to continue returning last good data value. We don't want aircraft
+# crashing. However if the I2C has crashed we're probably stuffed.
+
+from time import sleep_ms
 from machine import SoftI2C, Pin
-from micropython import const
+from setting import SDA_PIN, SCL_PIN
+from vector3d import Vector3d
 
-from setting import *
-from utility import *
+class MPUException(OSError):
+    """
+    Exception for MPU devices
+    """
 
-PWR_MGMT_1   = const(0x6B)
-SMPLRT_DIV   = const(0x19)
-CONFIG       = const(0x1A)
-GYRO_CONFIG  = const(0x1B)
-ACCEL_CONFIG = const(0x1C)
-INT_ENABLE   = const(0x38)
-ACCEL_XOUT_H = const(0x3B)
-ACCEL_YOUT_H = const(0x3D)
-ACCEL_ZOUT_H = const(0x3F)
-GYRO_XOUT_H  = const(0x43)
-GYRO_YOUT_H  = const(0x45)
-GYRO_ZOUT_H  = const(0x47)
-TEMP_OUT_H   = const(0X41)
+    pass
 
-class MPU6050:
-    def __init__(self, address=0x68):
-        scl_pin = Pin(SCL_PIN)
-        sda_pin = Pin(SDA_PIN)
-        self._i2c = SoftI2C(scl=scl_pin, sda=sda_pin) 
-        self._addr = address
 
-        #Close the sleep mode
-        #Write to power management register to wake up mpu6050
-        self.__register(PWR_MGMT_1, 0)
+def bytes_toint(msb, lsb):
+    """
+    Convert two bytes to signed integer (big endian)
+    for little endian reverse msb, lsb arguments
+    Can be used in an interrupt handler
+    """
+    if not msb & 0x80:
+        return msb << 8 | lsb  # +ve
+    return -(((msb ^ 255) << 8) | (lsb ^ 255) + 1)
 
-        #configurate the digital low pass filter
-        self.__register(CONFIG, 1)
 
-        
-        #set the gyro scale to 500 deg/s: 250 deg/s (131) --> 0x00, 500 deg/s (65.5) --> 0x08, 1000 deg/s (32.8) --> 0x10, 2000 deg/s (16.4)--> 0x18
-        self.__register(GYRO_CONFIG, 0x08)
-        # self.scaleFactorGyro = 500.0 / 32768.0 #for 500 deg/s, check data sheet 65.536
+class MPU6050(object):
+    """
+    Module for InvenSense IMUs. Base class implements MPU6050 6DOF sensor, with
+    features common to MPU9150 and MPU9250 9DOF sensors.
+    """
 
-        # #set the accelerometer scale to 4g: 2g (16384)--> 0x00, 4g (8192)--> 0x08, 8g (4096) --> 0x10, 16g (2048)--> 0x18
-        self.__register(ACCEL_CONFIG, 0x08)
-        # self.scaleFactorAccel = 4.0 / 32768.0 #for 4g, check data sheet
+    _I2Cerror = "I2C failure when communicating with IMU"
+    _mpu_addr = (104, 105)  # addresses of MPU9150/MPU6050. There can be two devices
+    _chip_id = 104
 
-        #Set interrupt enable register to 0 .. disable interrupts
-        #self.__register(INT_ENABLE, 0x00)
+    def __init__(self, device_addr=None, transposition=(0, 1, 2), scaling=(1, 1, 1)):
 
-        self.__get_scale_range()
+        self._accel = Vector3d(transposition, scaling, self._accel_callback)
+        self._gyro = Vector3d(transposition, scaling, self._gyro_callback)
+        self.buf1 = bytearray(1)  # Pre-allocated buffers for reads: allows reads to
+        self.buf2 = bytearray(2)  # be done in interrupt handlers
+        self.buf3 = bytearray(3)
+        self.buf6 = bytearray(6)
 
-        self.gyroXoffs = self.gyroYoffs = self.gyroZoffs = 0
+        sleep_ms(200)  # Ensure PSU and device have settled
+        self._mpu_i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN))
 
-    def __get_scale_range(self):
-        scale = 1
-        
-        #set the gyro scale to 500 deg/s: 250 deg/s (131) --> 0x00, 500 deg/s (65.5) --> 0x08, 1000 deg/s (32.8) --> 0x10, 2000 deg/s (16.4)--> 0x18
-        x = self.__read_raw_data(GYRO_CONFIG, 1)
-        if x == b'\x00':
-            scale = 250
-        elif x == b'\x08':
-            scale = 500
-        elif x == b'\x10':
-            scale = 1000
-        else:
-            scale = 2000
-
-        self.scaleFactorGyro = scale * 1.0 / 32768.0
-
-        # #set the accelerometer scale to 4g: 2g (16384)--> 0x00, 4g (8192)--> 0x08, 8g (4096) --> 0x10, 16g (2048)--> 0x18
-        x = self.__read_raw_data(ACCEL_CONFIG, 1)        
-        if x == b'\x00':
-            scale = 2
-        elif x == b'\x08':
-            scale = 4
-        elif x == b'\x10':
-            scale = 8
-        else:
-            scale = 16
-
-        self.scaleFactorAccel = scale * 1.0 / 32768.0
-
-    def __register(self, reg, data): #Write the registor of i2c device.
-        self._i2c.start()
-        self._i2c.writeto(self._addr, bytearray([reg, data]))
-        self._i2c.stop()
-
-    def __bytes_toint(self, firstbyte, secondbyte):
-        if not firstbyte & 0x80:
-            return firstbyte << 8 | secondbyte
-        return - (((firstbyte ^ 255) << 8) | (secondbyte ^ 255) + 1)
-
-    def __read_raw_data(self, addr, size):
-        try:
-            self._i2c.start()
-            a = [0] * size
-            a = self._i2c.readfrom_mem(self._addr, addr, size)
-        finally:
-            self._i2c.stop()
-            return a
-
-    def __get_raw_value(self, name=None):
-        if name == None:
-            raw_ints = self.__read_raw_data(ACCEL_XOUT_H, 14)
-            vals = {}
-            vals["AcX"] = self.__bytes_toint(raw_ints[0], raw_ints[1])
-            vals["AcY"] = self.__bytes_toint(raw_ints[2], raw_ints[3])
-            vals["AcZ"] = self.__bytes_toint(raw_ints[4], raw_ints[5])
-            vals["Tmp"] = self.__bytes_toint(raw_ints[6], raw_ints[7]) / 340.00 + 36.53
-            vals["GyX"] = self.__bytes_toint(raw_ints[8], raw_ints[9])
-            vals["GyY"] = self.__bytes_toint(raw_ints[10], raw_ints[11])
-            vals["GyZ"] = self.__bytes_toint(raw_ints[12], raw_ints[13])
-            return vals
-
-        a = [0,0]
-        if (name == 'GyZ'):
-            a = self.__read_raw_data(GYRO_ZOUT_H, 2)
-        elif name == 'GyY':
-            a = self.__read_raw_data(GYRO_YOUT_H, 2)
-        elif name == 'GyX':
-            a = self.__read_raw_data(GYRO_XOUT_H, 2)
-        elif name == 'AcX':
-            a = self.__read_raw_data(ACCEL_XOUT_H, 2)
-        elif name == 'AcY':
-            a = self.__read_raw_data(ACCEL_YOUT_H, 2)
-        elif name == 'AcZ':
-            a = self.__read_raw_data(ACCEL_ZOUT_H, 2)
-        return self.__bytes_toint(a[0], a[1])
-    
-    def __get_value(self, name=None, n_samples=1, sleep=0):
-        try:
-            result = 0
-            if name == None:
-                vals = {}
-                vals['AcX'] = vals['AcY'] = vals['AcZ'] = vals['GyX'] = vals['GyY'] = vals['GyZ'] = 0.0 
-                for i in range(n_samples):
-                    data = self.__get_raw_value()
-                    vals['AcX'] += data['AcX'] * self.scaleFactorAccel / n_samples
-                    vals['AcY'] += data['AcY'] * self.scaleFactorAccel / n_samples
-                    vals['AcZ'] += data['AcZ'] * self.scaleFactorAccel / n_samples
-                    vals['GyX'] += data['GyX'] * self.scaleFactorGyro / n_samples
-                    vals['GyY'] += data['GyY'] * self.scaleFactorGyro / n_samples
-                    vals['GyZ'] += data['GyZ'] * self.scaleFactorGyro / n_samples
-                    if sleep:
-                        time.sleep_ms(sleep)
-                result = vals
+        if device_addr is None:
+            devices = set(self._mpu_i2c.scan())
+            mpus = devices.intersection(set(self._mpu_addr))
+            number_of_mpus = len(mpus)
+            if number_of_mpus == 0:
+                raise MPUException("No MPU's detected")
+            elif number_of_mpus == 1:
+                self.mpu_addr = mpus.pop()
             else:
-                val = 0.0
-                for i in range(n_samples):
-                    val += self.__get_raw_value(name) / n_samples
-                    if sleep:
-                        time.sleep_ms(sleep)
+                raise ValueError("Two MPU's detected: must specify a device address")
+        else:
+            if device_addr not in (0, 1):
+                raise ValueError("Device address must be 0 or 1")
+            self.mpu_addr = self._mpu_addr[device_addr]
 
-                if name == 'AcX' or name == 'AcY' or name == 'AcZ':
-                    val = val * self.scaleFactorAccel
-                else:
-                    val = val * self.scaleFactorGyro
+        self.chip_id  # Test communication by reading chip_id: throws exception on error
+        # Can communicate with chip. Set it up.
+        self.wake()  # wake it up
+        self.passthrough = True  # Enable mag access from main I2C bus
+        self.accel_range = 0  # default to highest sensitivity
+        self.gyro_range = 0  # Likewise for gyro
 
-                result = val
-        finally:
-            return result
+    # read from device
+    def _read(self, buf, memaddr, addr):  
+        """
+        Read bytes to pre-allocated buffer Caller traps OSError.
+            addr = I2C device address
+            memaddr = memory location within the I2C device
+        """
+        self._mpu_i2c.readfrom_mem_into(addr, memaddr, buf)
 
-    def begin(self):
-        self.angleX = 0.0
-        self.angleY = 0.0
-        self.angleZ = 0.0
-        self.update_time = time.time_ns()
-    
-    def calibrateZ(self, n_samples=2000): #calibrate for Z axis
-        # print("Calib...") #TODO
-        val = self.__get_raw_value('GyZ') * self.scaleFactorGyro
-        self.gyroZoffs_min = self.gyroZoffs_max = val
-        self.gyroZoffs = val
-        Zoffs = val / n_samples
-        for _ in range(n_samples - 1):
-            val = self.__get_raw_value('GyZ') * self.scaleFactorGyro
-            if self.gyroZoffs_min > val:
-                self.gyroZoffs_min = val
-            if self.gyroZoffs_max < val:
-                self.gyroZoffs_max = val
-            Zoffs += val / n_samples
-        self.gyroZoffs = Zoffs
-        # print("...done") #TODO
-        
-    def updateZ(self):
-        t_now = time.time_ns()
-        gyrZ = self.__get_value('GyZ') - self.gyroZoffs
-        deltaT = (t_now - self.update_time) * 1e-9
-        self.update_time = t_now        
-        self.angleZ += gyrZ * deltaT
+    # write to device
+    def _write(self, data, memaddr, addr):
+        """
+        Perform a memory write. Caller should trap OSError.
+        """
+        self.buf1[0] = data
+        self._mpu_i2c.writeto_mem(addr, memaddr, self.buf1)
 
-    def calibrate(self, n_samples=1000, sleep=0): #calibrate for all axis
-        data = self.__get_value(None, n_samples, sleep)
-        self.acXoffs = data['AcX']
-        self.acYoffs = data['AcY']
-        self.acZoffs = data['AcZ']
-        self.gyroXoffs = data['GyX']
-        self.gyroYoffs = data['GyY']
-        self.gyroZoffs = data['GyZ']
-
-    def update(self):
-        #The accelerometer data is reliable only on the long term, so a "low pass" filter has to be used.
-        #The gyroscope data is reliable only on the short term, as it starts to drift on the long term.
-        t_now = time.time_ns()
-        data = self.__get_value()
-        accX = data['AcX']
-        accY = data['AcY']
-        accZ = data['AcZ']
-        gyrX = data['GyX'] - self.gyroXoffs
-        gyrY = data['GyY'] - self.gyroYoffs
-        gyrZ = data['GyZ'] - self.gyroZoffs
-
-        ax = math.atan2(accX, math.sqrt( math.pow(accY, 2) + math.pow(accZ, 2) ) ) * 180 / 3.1415926
-        ay = math.atan2(accY, math.sqrt( math.pow(accX, 2) + math.pow(accZ, 2) ) ) * 180 / 3.1415926
-        
-        deltaT = (t_now - self.update_time) * 1e-9
-        self.update_time = t_now
-
-        if accZ > 0:
-          self.angleX -= gyrY * deltaT
-          self.angleY += gyrX * deltaT
-        else :
-          self.angleX += gyrY * deltaT
-          self.angleY -= gyrX * deltaT
-
-        self.angleZ += gyrZ * deltaT
-
-        # complementary filter
-        # set 0.5sec = tau = deltaT * A / (1 - A)
-        # so A = tau / (tau + deltaT)
-        filter_coefficient = 0.5 / (0.5 + deltaT)
-        self.angleX = self.angleX * filter_coefficient + ax * (1 - filter_coefficient)
-        self.angleY = self.angleY * filter_coefficient + ay * (1 - filter_coefficient)
-
-    def get_angleX(self):      
-        return self.angleX
-
-    def get_angleY(self):
-        return self.angleY
-
-    def get_angleZ(self, absolute=False): #by default angleZ returns value from 0 to 360 in anti-clockwise
-        if absolute:
-            return abs(self.angleZ)
-        return self.angleZ
-    
-    def get_gyro_roll(self, n_samples=10):
-        return round(self.__get_value('GyX', n_samples))
-
-    def get_gyro_pitch(self, n_samples=10):
-        return round(self.__get_value('GyY', n_samples))
-
-    def get_gyro_yaw(self, n_samples=10):
-        return round(self.__get_value('GyZ', n_samples))
-
-    def get_accel(self, name, n_samples=10):
-        if name == 'x':
-            return self.get_accel_x(n_samples)
-        if name == 'y':
-            return self.get_accel_y(n_samples)
-        return self.get_accel_z(n_samples)
-
-    def get_accel_x(self, n_samples=10):        
-        return max(min(100, round(self.__get_value('AcX', n_samples) * 100)), -100)
-
-    def get_accel_y(self, n_samples=10):
-        return max(min(100, round(self.__get_value('AcY', n_samples) * 100)), -100)
-
-    def get_accel_z(self, n_samples=10):
-        return max(min(100, round(self.__get_value('AcZ', n_samples) * 100 - 100)), -100)
-
-    def get_accels(self, n_samples=1):
-        data = self.__get_value(None, n_samples)
-        return (data['AcX'], data['AcY'], data['AcZ'] - 1)
-
-    def get_gyros(self, n_samples=1):
-        data = self.__get_value(None, n_samples)
-        return (data['GyX'] - self.gyroXoffs, data['GyY'] - self.gyroYoffs, data['GyZ'] - self.gyroZoffs)
-
-    def is_shaked(self, shake_threshold=4.0, avg_count=10, wait_time=0.1):
+    # wake
+    def wake(self):
+        """
+        Wakes the device.
+        """
         try:
-            x = y = z = 0
-            total = 0.0
-            for _ in range(avg_count):
-                (x1, y1, z1) = self.get_accels()
-                total += abs(x1 - x) + abs(y1 - y) + abs(z1 - z)
-                x = x1
-                y = y1
-                z = z1
-                time.sleep(wait_time / avg_count)
-        finally:
-            return total > shake_threshold
+            self._write(0x01, 0x6B, self.mpu_addr)  # Use best clock source
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return "awake"
+
+    # mode
+    def sleep(self):
+        """
+        Sets the device to sleep mode.
+        """
+        try:
+            self._write(0x40, 0x6B, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return "asleep"
+
+    # chip_id
+    @property
+    def chip_id(self):
+        """
+        Returns Chip ID
+        """
+        try:
+            self._read(self.buf1, 0x75, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        chip_id = int(self.buf1[0])
+        if chip_id != self._chip_id:
+            print(f"Unexpected chip ID: 0x{chip_id:02x}. Possible clone chip?")
+        return chip_id
+
+    @property
+    def sensors(self):
+        """
+        returns sensor objects accel, gyro
+        """
+        return self._accel, self._gyro
+
+    # get temperature
+    @property
+    def temperature(self):
+        """
+        Returns the temperature in degree C.
+        """
+        try:
+            self._read(self.buf2, 0x41, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return bytes_toint(self.buf2[0], self.buf2[1]) / 340 + 35  # I think
+
+    # passthrough
+    @property
+    def passthrough(self):
+        """
+        Returns passthrough mode True or False
+        """
+        try:
+            self._read(self.buf1, 0x37, self.mpu_addr)
+            return self.buf1[0] & 0x02 > 0
+        except OSError:
+            raise MPUException(self._I2Cerror)
+
+    @passthrough.setter
+    def passthrough(self, mode):
+        """
+        Sets passthrough mode True or False
+        """
+        if type(mode) is bool:
+            val = 2 if mode else 0
+            try:
+                self._write(val, 0x37, self.mpu_addr)  # I think this is right.
+                self._write(0x00, 0x6A, self.mpu_addr)
+            except OSError:
+                raise MPUException(self._I2Cerror)
+        else:
+            raise ValueError("pass either True or False")
+
+    # sample rate. Not sure why you'd ever want to reduce this from the default.
+    @property
+    def sample_rate(self):
+        """
+        Get sample rate as per Register Map document section 4.4
+        SAMPLE_RATE= Internal_Sample_Rate / (1 + rate)
+        default rate is zero i.e. sample at internal rate.
+        """
+        try:
+            self._read(self.buf1, 0x19, self.mpu_addr)
+            return self.buf1[0]
+        except OSError:
+            raise MPUException(self._I2Cerror)
+
+    @sample_rate.setter
+    def sample_rate(self, rate):
+        """
+        Set sample rate as per Register Map document section 4.4
+        """
+        if rate < 0 or rate > 255:
+            raise ValueError("Rate must be in range 0-255")
+        try:
+            self._write(rate, 0x19, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+
+    # Low pass filters. Using the filter_range property of the MPU9250 is
+    # harmless but gyro_filter_range is preferred and offers an extra setting.
+    @property
+    def filter_range(self):
+        """
+        Returns the gyro and temperature sensor low pass filter cutoff frequency
+        Pass:               0   1   2   3   4   5   6
+        Cutoff (Hz):        250 184 92  41  20  10  5
+        Sample rate (KHz):  8   1   1   1   1   1   1
+        """
+        try:
+            self._read(self.buf1, 0x1A, self.mpu_addr)
+            res = self.buf1[0] & 7
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return res
+
+    @filter_range.setter
+    def filter_range(self, filt):
+        """
+        Sets the gyro and temperature sensor low pass filter cutoff frequency
+        Pass:               0   1   2   3   4   5   6
+        Cutoff (Hz):        250 184 92  41  20  10  5
+        Sample rate (KHz):  8   1   1   1   1   1   1
+        """
+        # set range
+        if filt in range(7):
+            try:
+                self._write(filt, 0x1A, self.mpu_addr)
+            except OSError:
+                raise MPUException(self._I2Cerror)
+        else:
+            raise ValueError("Filter coefficient must be between 0 and 6")
+
+    # accelerometer range
+    @property
+    def accel_range(self):
+        """
+        Accelerometer range
+        Value:              0   1   2   3
+        for range +/-:      2   4   8   16  g
+        """
+        try:
+            self._read(self.buf1, 0x1C, self.mpu_addr)
+            ari = self.buf1[0] // 8
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return ari
+
+    @accel_range.setter
+    def accel_range(self, accel_range):
+        """
+        Set accelerometer range
+        Pass:               0   1   2   3
+        for range +/-:      2   4   8   16  g
+        """
+        ar_bytes = (0x00, 0x08, 0x10, 0x18)
+        if accel_range in range(len(ar_bytes)):
+            try:
+                self._write(ar_bytes[accel_range], 0x1C, self.mpu_addr)
+            except OSError:
+                raise MPUException(self._I2Cerror)
+        else:
+            raise ValueError("accel_range can only be 0, 1, 2 or 3")
+
+    # gyroscope range
+    @property
+    def gyro_range(self):
+        """
+        Gyroscope range
+        Value:              0   1   2    3
+        for range +/-:      250 500 1000 2000  degrees/second
+        """
+        # set range
+        try:
+            self._read(self.buf1, 0x1B, self.mpu_addr)
+            gri = self.buf1[0] // 8
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        return gri
+
+    @gyro_range.setter
+    def gyro_range(self, gyro_range):
+        """
+        Set gyroscope range
+        Pass:               0   1   2    3
+        for range +/-:      250 500 1000 2000  degrees/second
+        """
+        gr_bytes = (0x00, 0x08, 0x10, 0x18)
+        if gyro_range in range(len(gr_bytes)):
+            try:
+                self._write(
+                    gr_bytes[gyro_range], 0x1B, self.mpu_addr
+                )  # Sets fchoice = b11 which enables filter
+            except OSError:
+                raise MPUException(self._I2Cerror)
+        else:
+            raise ValueError("gyro_range can only be 0, 1, 2 or 3")
+
+    # Accelerometer
+    @property
+    def accel(self):
+        """
+        Acceleremoter object
+        """
+        return self._accel
+
+    def _accel_callback(self):
+        """
+        Update accelerometer Vector3d object
+        """
+        try:
+            self._read(self.buf6, 0x3B, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        self._accel._ivector[0] = bytes_toint(self.buf6[0], self.buf6[1])
+        self._accel._ivector[1] = bytes_toint(self.buf6[2], self.buf6[3])
+        self._accel._ivector[2] = bytes_toint(self.buf6[4], self.buf6[5])
+        scale = (16384, 8192, 4096, 2048)
+        self._accel._vector[0] = self._accel._ivector[0] / scale[self.accel_range]
+        self._accel._vector[1] = self._accel._ivector[1] / scale[self.accel_range]
+        self._accel._vector[2] = self._accel._ivector[2] / scale[self.accel_range]
+
+    def get_accel_irq(self):
+        """
+        For use in interrupt handlers. Sets self._accel._ivector[] to signed
+        unscaled integer accelerometer values
+        """
+        self._read(self.buf6, 0x3B, self.mpu_addr)
+        self._accel._ivector[0] = bytes_toint(self.buf6[0], self.buf6[1])
+        self._accel._ivector[1] = bytes_toint(self.buf6[2], self.buf6[3])
+        self._accel._ivector[2] = bytes_toint(self.buf6[4], self.buf6[5])
+
+    # Gyro
+    @property
+    def gyro(self):
+        """
+        Gyroscope object
+        """
+        return self._gyro
+
+    def _gyro_callback(self):
+        """
+        Update gyroscope Vector3d object
+        """
+        try:
+            self._read(self.buf6, 0x43, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        self._gyro._ivector[0] = bytes_toint(self.buf6[0], self.buf6[1])
+        self._gyro._ivector[1] = bytes_toint(self.buf6[2], self.buf6[3])
+        self._gyro._ivector[2] = bytes_toint(self.buf6[4], self.buf6[5])
+        scale = (131, 65.5, 32.8, 16.4)
+        self._gyro._vector[0] = self._gyro._ivector[0] / scale[self.gyro_range]
+        self._gyro._vector[1] = self._gyro._ivector[1] / scale[self.gyro_range]
+        self._gyro._vector[2] = self._gyro._ivector[2] / scale[self.gyro_range]
+
+    def get_gyro_irq(self):
+        """
+        For use in interrupt handlers. Sets self._gyro._ivector[] to signed
+        unscaled integer gyro values. Error trapping disallowed.
+        """
+        self._read(self.buf6, 0x43, self.mpu_addr)
+        self._gyro._ivector[0] = bytes_toint(self.buf6[0], self.buf6[1])
+        self._gyro._ivector[1] = bytes_toint(self.buf6[2], self.buf6[3])
+        self._gyro._ivector[2] = bytes_toint(self.buf6[4], self.buf6[5])
