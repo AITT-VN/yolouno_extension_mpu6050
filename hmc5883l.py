@@ -2,7 +2,7 @@ import math
 from machine import SoftI2C, Pin
 from setting import SDA_PIN, SCL_PIN
 
-from ustruct import pack
+from struct import pack
 from array import array
 
 
